@@ -1,0 +1,17 @@
+# Incident reports can contain internal paths and computer names.
+reports/
+*[Rr]eport*.json
+*[Rr]eport*.html
+
+# Generated distribution package.
+AgentFramework-QuickScan.zip
+
+# Local secrets.
+.env
+.env.*
+!.env.example
+
+# Operating-system metadata.
+.DS_Store
+Thumbs.db
+Desktop.ini

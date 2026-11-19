@@ -22,6 +22,12 @@ You can extract it anywhere; keep all the files together.
 | Windows | `Run-QuickScan.cmd` | `Run-FullScan.cmd` |
 | Mac | `Run-QuickScan.command` | `Run-FullScan.command` |
 
+**Mac permissions (one-time, if needed):** Open Terminal and type
+`chmod u+x `, including the space at the end. Drag both `.command` files
+from the extracted folder into Terminal, then press Return. This gives
+those files permission to run. You can then double-click them normally.
+It does not bypass Gatekeeper or your organization's security controls.
+
 **Quick** looks for suspicious filenames in your user-profile/home folder.
 **Full** also checks package information, dependency files, and cached
 packages across a broader area: local fixed drives on Windows, or the main

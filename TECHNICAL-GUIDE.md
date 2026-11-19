@@ -204,6 +204,19 @@ so handle reports as internal incident evidence.
 
 ## macOS command-line options (advanced)
 
+The packaged ZIP marks the `.command` launchers executable, but source
+downloads or some extraction tools may lose those permissions. For approved
+scripts, run this once from the extracted folder if needed:
+
+```shell
+chmod u+x ./Run-QuickScan.command ./Run-FullScan.command
+```
+
+This sets the normal executable permission; it does not remove quarantine or
+override Gatekeeper/organizational policy. Contact IT if those controls block
+execution. The `.sh` scanner does not need its own executable bit when invoked
+through `/bin/bash`, as the launchers do.
+
 From Terminal in the extracted folder:
 
 ```shell

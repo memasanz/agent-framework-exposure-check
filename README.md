@@ -22,7 +22,7 @@ You can extract it anywhere; keep all the files together.
 | Windows | `Run-QuickScan.cmd` | `Run-FullScan.cmd` |
 | Mac | `Run-QuickScan.command` | `Run-FullScan.command` |
 
-**Mac permissions (one-time, if needed):** Open Terminal and type
+**Mac launch permissions (one-time, if needed):** Open Terminal and type
 `chmod u+x `, including the space at the end. Drag both `.command` files
 from the extracted folder into Terminal, then press Return. This gives
 those files permission to run. You can then double-click them normally.
@@ -36,6 +36,13 @@ data volume on Mac. Other mounted Mac volumes are not included.
 Full scans ask you to confirm: press **Y** on Windows, or type **FULL** and
 press Return on Mac. They can take much longer than Quick scans.
 Leave the scan window open until the result appears.
+
+**Mac access warnings:** The scanner checks access before searching. If macOS
+blocks folders, ask IT to review **System Settings > Privacy & Security >
+Files & Folders / Full Disk Access** for the terminal app opening the launcher,
+then rerun after approved changes. The script never changes these permissions.
+Skipping protected folders or using `sudo` is not a substitute for authorized
+access.
 
 ## 3. Open your report
 
@@ -54,6 +61,11 @@ Each run gets a new name, so earlier reports are not overwritten.
 | `IndicatorsFound` | Something needs investigation. Contact your security/IT team. |
 | `Incomplete` | Some locations could not be checked. Ask your security/IT team to review the gaps. |
 | `NoIndicatorsInScannedScope` | Nothing matched in the locations checked. This does **not** prove the computer is safe. |
+
+Mac reports also show **Coverage** separately, including when indicators are
+found. Repetitive diagnostics and example skipped links are collapsed in HTML;
+the JSON retains every diagnostic and skipped path. Skipped links still mean
+incomplete coverage, not that those targets are safe.
 
 If anything is flagged, **do not delete the files or start Python/pip in the
 suspect environment**. Send both reports to your security/IT contact through

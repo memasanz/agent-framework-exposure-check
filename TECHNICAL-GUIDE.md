@@ -67,10 +67,12 @@ If Gatekeeper, privacy permissions, or endpoint controls block access or
 execution, use your approved IT process rather than disabling protections.
 Have IT review/approve the files before broad distribution.
 
-**Validation:** Windows behavior is tested on PowerShell 5.1 and 7. The
-macOS-compatible shell scanner and launcher logic are fixture-tested using
-Git Bash on Windows; a native macOS/Finder launch has not been tested here.
-Have IT perform a macOS smoke test before broad distribution.
+**Validation:** Windows behavior is tested on PowerShell 5.1 and 7.
+The shell scanner and launcher logic have native macOS Bash 3.2 regression
+fixtures (`/usr/bin/ruby tests/macos_test.rb`, using Ruby's standard library
+and bundled Minitest; no package installation or Python).
+Finder double-click launching still needs an IT smoke test before broad
+distribution.
 
 ## Windows command-line options (advanced)
 
@@ -243,17 +245,58 @@ use explicit, authorized `--root` locations for broader coverage, such as
 These are examples, not mandatory roots. Do not run with `sudo` or grant
 additional filesystem permissions without IT approval.
 
-Directory searches do not follow symlinks, enter `.git`, or cross into nested
-filesystem mounts. Pass an authorized volume's own mount path as a separate
-root to inspect it. macOS privacy restrictions can leave coverage gaps, which
-appear in `Errors`. Symlinks appear in `SkippedSymlinks` (the Windows field is
-`SkippedReparsePoints`). The report has `CandidateFilesExamined`, counting
-files selected by filename, not every file traversed.
+macOS directory searches include hidden folders and `.git`, but do not follow
+symlinks or cross into nested filesystem mounts. Pass authorized physical
+targets and volume mount paths as separate `--root` arguments to inspect them.
+`RequestedRoots`, canonical `Roots`, and `ScopePolicy` make the requested roots
+and these boundaries explicit; the Full launcher is still main-data-volume
+only, not every mounted volume or container.
+
+An enumeration-only access preflight probes each valid root and selected
+protected home folders that fall within that root. `AccessPreflight` records
+the results. A successful probe is not proof of Full Disk Access or of access
+to every descendant. On an authorized machine, IT can review **System Settings >
+Privacy & Security > Files & Folders / Full Disk Access** for the launching
+terminal app and approve access before a rerun. The scanner neither changes
+permissions nor elevates. Do not exclude protected folders to obtain a
+successful status.
+
+`Errors` retains diagnostics with the affected `Path`, `Category`, original
+diagnostic in `Detail`, `RetryOutcome`, and `Resolved`. Categories distinguish
+`AccessDenied`, `Disappeared`, `Interrupted`, `IOFailure`, `TraversalFailure`, `InvalidRoot`,
+`InspectionLimit`, and other tool failures. A disappeared entry is rechecked
+once: a rediscovered directory is rescanned once, a rediscovered file/link is
+selected again using the original mode's rules, and a still-missing path remains
+an unresolved gap. Retries must resolve within the original root and filesystem;
+outside-scope or unverifiable paths are not rescanned.
+If BSD `find` aborts with `fts_read: Interrupted system call`, its unread
+subtree is unknown, so the original root is re-enumerated once. Partial
+candidates are retained; repeated interruption remains an unresolved gap.
+This retry does not change permissions or retry access denials individually.
+Retry failures retain their diagnostics too. Search process exit codes live
+in `DirectorySearches`, rather than adding a duplicate root-level error.
+`UnresolvedErrorCount` excludes diagnostics resolved by a successful retry.
+Identical diagnostic records are deduplicated across attempts.
+
+Symlinks appear in `SkippedSymlinks` and the structured `Symlinks` array
+(the Windows field is `SkippedReparsePoints`). Target-type classification
+uses filesystem metadata only; it does not read target contents, establish
+target coverage, or authorize following a link. Indicator names are checked
+on the link itself before it is skipped, including broken links. All skipped
+links conservatively remain coverage gaps. HTML groups file, directory,
+and unavailable/other target counts and shows at most 20 examples; JSON
+retains every skipped path. No blanket `find -L` traversal is used.
+`CandidateFilesExamined` counts examinations of regular files selected by
+filename, not every file traversed or symlink name checked. Re-enumeration
+or overlapping roots can examine the same path more than once; findings,
+package inventory, and skipped-link records are deduplicated.
 
 Quick mode opens no inspected file contents and checks the same four
 hook/helper names as Windows. Deep mode adds package `METADATA`, common exact
 pins, TOML package records, conventional Pipfile.lock objects, and cached
-wheel/ZIP/pip bodies with advisory hash checks. It is not a dependency resolver.
+wheel/ZIP/pip bodies with advisory hash checks. All four hook/helper indicator
+names are checked inside ZIP/wheel entries as well as on disk. It is not a
+dependency resolver.
 Dependency files over 8 MiB and archived metadata over 1 MiB are reported as
 coverage errors rather than read without limits. Archive entries with unusual
 embedded newlines may not be parsed reliably by the system ZIP listing tool.
@@ -264,6 +307,28 @@ reports are created with owner-only permissions; existing reports are never
 overwritten. An explicit `--report` must end in `.json`.
 Temporary inspection files are private and removed on normal exit/interruption.
 Nothing is uploaded and no remediation is performed.
+
+macOS reports keep the legacy `Status` and add independent `FindingStatus`
+(`NoIndicatorsFound` or `IndicatorsFound`) and `CoverageStatus` (`Complete` or
+`Incomplete`). `Complete` applies only to the requested filesystem scope and
+documented inspection rules, not historical absence or whole-machine safety.
+Coverage remains visible even when indicators are found.
+
+The macOS scanner and launchers return these process exit codes:
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Reports saved, no indicators, requested inspection complete within documented limits. |
+| `1` | Fatal setup/tool/report-writing failure; a report pair may be absent or partial. |
+| `2` | Reports saved, no indicators, coverage incomplete. |
+| `3` | Reports saved with indicators, requested inspection complete within documented limits. |
+| `4` | Reports saved with indicators and incomplete coverage. |
+
+Signal interruption can return the usual `130`/`143` without reports.
+The launchers distinguish incomplete reports and indicators from a fatal
+scanner failure. Automation must not treat a nonzero code as proof that no
+reports exist, nor code `0` as proof that the machine is safe. Windows exit
+behavior is unchanged.
 
 ## Reading and sharing reports
 
@@ -294,7 +359,7 @@ warnings even when findings are present.
 | `PackageOnDisk` | Affected package metadata exists on disk. Check whether its path is an installed environment, staging directory, or extracted cache. |
 | `StartupHookOnDisk` / `HelperModuleOnDisk` | Advisory-listed filenames exist. Preserve and investigate; names alone are not cryptographic proof. A hook in active `site-packages` is urgent. |
 | `KnownMaliciousWheelHash` | File bytes match a wheel SHA-256 from the advisory. A cached wheel alone does not establish execution. |
-| `CachedPackage` / `CachedStartupHook` | Affected metadata or startup-hook filename exists inside a wheel/ZIP/pip HTTP cache body. |
+| `CachedPackage` / `CachedStartupHook` / `CachedHelperModule` | Affected metadata, startup-hook, or helper filename exists inside a wheel/ZIP/pip HTTP cache body. The helper kind is emitted by the macOS scanner. |
 | `DependencyReference` | An exact bad version appears in a supported dependency declaration/artifact reference. Establish whether it was installed. |
 
 Every finding has `LocationType`: `SitePackages`, `Archive`, or `OtherOnDisk`.
@@ -303,15 +368,17 @@ This is a path-based triage aid, not proof of installation or execution.
 matches in `site-packages`, avoid launching that environment and contact your
 security team for verification/containment. Do not automatically delete files.
 
-Always inspect `Errors` and `SkippedReparsePoints`, even with
+Always inspect `Errors` and `SkippedReparsePoints` (macOS: `SkippedSymlinks` and
+`CoverageStatus`), even with
 `IndicatorsFound`. Symlinks/junctions are not followed; pass their physical
-targets as additional roots. `.git` directories are excluded. ZIP inspection
+targets as additional roots. Windows excludes `.git`; macOS includes it. ZIP inspection
 does not cover tarballs, nested archives, encrypted archives, or container
 layers. Dependency parsing covers common requirements/constraints, uv/Poetry/PDM
 package records, Pipfile.lock, and direct exact pins; it is not a universal
-dependency resolver or log scanner. The script returns a report object, not
-an incident-status process exit code. Fleet automation should evaluate its
-`Status`, `Findings`, and coverage fields.
+dependency resolver or log scanner. The Windows script returns a report
+object, not an incident-status process exit code. Fleet automation should
+evaluate `Status`, `Findings`, and coverage fields; macOS also has the exit
+codes described above.
 
 Deep-mode package inventory includes unaffected versions too; Quick mode does
 not inventory package versions. Finding only 1.26.0 now

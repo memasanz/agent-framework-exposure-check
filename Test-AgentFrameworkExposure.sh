@@ -13,6 +13,8 @@ report=
 work=
 find_pid=
 files_examined=0
+symlink_samples=0
+root_retry_done=false
 started=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 
 usage() {
@@ -22,7 +24,8 @@ usage() {
         '  --root DIRECTORY    Scan this directory instead of HOME; repeat as needed' \
         '  --report FILE       JSON report destination (must not already exist)' \
         '  --help              Show this help' \
-        'Default: Quick scan of HOME, report saved in HOME. Never executes Python.'
+        'Default: Quick scan of HOME, report saved in HOME. Never executes Python.' \
+        'Exit codes: 0=no indicators, 1=fatal error, 2=incomplete, 3=indicators, 4=indicators and incomplete.'
 }
 
 while (( $# )); do
@@ -85,18 +88,27 @@ cleanup() {
     rm -f -- "$work/findings" "$work/errors" "$work/skipped" "$work/inventory" \
         "$work/roots" "$work/candidates" "$work/find-errors" "$work/zip-entries" \
         "$work/metadata" "$work/tool-errors" "$work/findings-html" "$work/errors-html" \
-        "$work/skipped-html" "$work/inventory-html" "$work/roots-html"
+        "$work/skipped-html" "$work/inventory-html" "$work/roots-html" \
+        "$work/preflight" "$work/preflight-html" "$work/symlinks" "$work/searches" \
+        "$work/retry-candidates" "$work/retry-errors"
     rmdir -- "$work"
 }
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-for name in findings errors skipped inventory roots findings-html errors-html skipped-html inventory-html roots-html; do
+for name in findings errors skipped inventory roots findings-html errors-html skipped-html inventory-html roots-html preflight preflight-html symlinks searches; do
     : > "$work/$name"
 done
 
 json_string() {
     local value=$1 character code i
+    # Most paths need no byte-by-byte encoding, which matters for large link inventories.
+    if [[ "$value" != *[[:cntrl:]]* ]]; then
+        value=${value//\\/\\\\}
+        value=${value//\"/\\\"}
+        printf '"%s"' "$value"
+        return
+    fi
     printf '"'
     for (( i=0; i<${#value}; i++ )); do
         character=${value:i:1}
@@ -108,7 +120,7 @@ json_string() {
             $'\t') printf '\\t' ;;
             *)
                 printf -v code '%d' "'$character"
-                if (( code < 32 )); then printf '\\u%04x' "$code"
+                if (( code >= 0 && code < 32 )); then printf '\\u%04x' "$code"
                 else printf '%s' "$character"
                 fi
                 ;;
@@ -150,19 +162,186 @@ html_list() {
 }
 
 add_error() {
+    local category=${4:-ToolFailure} retry=${5:-NotAttempted} resolved=${6:-false}
     {
         printf '{"Path":'; json_string "$1"
         printf ',"Operation":'; json_string "$2"
         printf ',"Detail":'; json_string "$3"
+        printf ',"Category":'; json_string "$category"
+        printf ',"RetryOutcome":'; json_string "$retry"
+        printf ',"Resolved":%s' "$resolved"
         printf '}\n'
     } >> "$work/errors"
-    html_row "$2" "$1" "$3" >> "$work/errors-html"
+    html_row "$category" "$2" "$1" "$retry" "$3" >> "$work/errors-html"
+}
+
+add_skipped_link() {
+    local path=$1 target_type=Unavailable
+    if [[ -d "$path" ]]; then target_type=Directory
+    elif [[ -f "$path" ]]; then target_type=File
+    fi
+    { json_string "$path"; printf '\n'; } >> "$work/skipped"
+    {
+        printf '{"Path":'; json_string "$path"
+        printf ',"TargetType":'; json_string "$target_type"
+        printf ',"Disposition":"NotFollowed"}\n'
+    } >> "$work/symlinks"
+    if (( symlink_samples < 20 )); then
+        { printf '<li>'; html_string "$path"; printf '</li>\n'; } >> "$work/skipped-html"
+        symlink_samples=$((symlink_samples+1))
+    fi
+}
+
+access_preflight() {
+    local root=$1 path diagnostic accessible
+    for path in "$root" "$HOME/Desktop" "$HOME/Documents" "$HOME/Downloads" \
+        "$HOME/Library/Mail" "$HOME/Library/Messages" "$HOME/Library/CloudStorage"; do
+        if [[ "$root" != / ]]; then
+            case "$path" in "$root"|"$root"/*) ;; *) continue ;; esac
+        fi
+        # A missing optional location is not an access failure.
+        if [[ ! -d "$path" || -L "$path" ]]; then continue; fi
+        accessible=true
+        diagnostic=
+        if ! find "$path" -mindepth 1 -maxdepth 1 -print > /dev/null 2>"$work/tool-errors"; then
+            accessible=false
+            diagnostic=$(< "$work/tool-errors")
+            printf 'ACCESS WARNING: Cannot enumerate %q. Coverage may be incomplete.\n' "$path" >&2
+        fi
+        {
+            printf '{"Path":'; json_string "$path"
+            printf ',"Accessible":%s,"Detail":' "$accessible"; json_string "$diagnostic"
+            printf '}\n'
+        } >> "$work/preflight"
+        html_row "$path" "$accessible" "$diagnostic" >> "$work/preflight-html"
+    done
+}
+
+find_candidates() {
+    local root=$1 output=$2 diagnostics=$3 retry=${4:-false} seconds=0 code=0
+    local patterns=( -iname agent_framework_meta.pth -o -iname af_runtime_diag.pth \
+        -o -iname af_runtime_diag.py -o -iname _telemetry.py )
+    if [[ "$mode" == Deep ]]; then
+        patterns+=( -o -iname METADATA -o -iname '*.whl' -o -iname '*.zip' -o -iname '*.body' \
+            -o -iname 'requirements*.txt' -o -iname 'requirements*.in' -o -iname 'constraints*.txt' \
+            -o -iname uv.lock -o -iname poetry.lock -o -iname pdm.lock -o -iname 'pylock*.toml' \
+            -o -iname Pipfile -o -iname Pipfile.lock -o -iname pyproject.toml -o -iname setup.cfg -o -iname setup.py )
+    fi
+    find "$root" -xdev \( -type l -o \( -type f \( "${patterns[@]}" \) \) \) -print0 \
+        > "$output" 2> "$diagnostics" &
+    find_pid=$!
+    while kill -0 "$find_pid" 2>/dev/null; do
+        sleep 1
+        seconds=$((seconds+1))
+        if (( seconds % 10 == 0 )); then printf 'Still searching %q (%s seconds)...\n' "$root" "$seconds"; fi
+    done
+    wait "$find_pid" || code=$?
+    find_pid=
+    record_search "$root" "$code" "$retry"
+    return "$code"
+}
+
+record_search() {
+    {
+        printf '{"Path":'; json_string "$1"
+        printf ',"ExitCode":%s,"Retry":%s}\n' "$2" "$3"
+    } >> "$work/searches"
+}
+
+filesystem_device() {
+    local device
+    if device=$(stat -f '%d' "$1" 2>"$work/tool-errors"); then
+        printf '%s' "$device"
+    elif device=$(stat -c '%d' "$1" 2>"$work/tool-errors"); then
+        printf '%s' "$device"
+    else
+        return 1
+    fi
+}
+
+retry_path_in_scope() (
+    local root=$1 path=$2 physical parent root_device path_device
+    shopt -u nocasematch
+    case "$path" in /*) ;; *) return 1 ;; esac
+    case "$path" in "$root"|"$root"/*) ;; *) [[ "$root" == / ]] || return 1 ;; esac
+    if [[ -d "$path" && ! -L "$path" ]]; then
+        physical=$(cd -P -- "$path" 2>"$work/tool-errors" && pwd -P) || return 1
+    else
+        parent=$(dirname -- "$path")
+        parent=$(cd -P -- "$parent" 2>"$work/tool-errors" && pwd -P) || return 1
+        physical="${parent%/}/${path##*/}"
+    fi
+    case "$physical" in "$root"|"$root"/*) ;; *) [[ "$root" == / ]] || return 1 ;; esac
+    root_device=$(filesystem_device "$root") || return 1
+    path_device=$(filesystem_device "$physical") || return 1
+    [[ "$root_device" == "$path_device" ]]
+)
+
+record_find_diagnostic() {
+    local root=$1 diagnostic=$2 path=$1 category=TraversalFailure retry=NotAttempted resolved=false
+    local allow_retry=${3:-true} suffix= retry_code=0 retry_detail= retry_diagnostic retry_interrupted=false
+    case "$diagnostic" in
+        'find: '*': Operation not permitted') suffix=': Operation not permitted'; category=AccessDenied ;;
+        'find: '*': Permission denied') suffix=': Permission denied'; category=AccessDenied ;;
+        'find: '*': No such file or directory') suffix=': No such file or directory'; category=Disappeared ;;
+        'find: '*': Input/output error') suffix=': Input/output error'; category=IOFailure ;;
+        'find: '*': Interrupted system call') category=Interrupted ;;
+    esac
+    if [[ -n "$suffix" ]]; then
+        path=${diagnostic#find: }
+        path=${path%"$suffix"}
+    fi
+    if [[ "$allow_retry" != true && ( "$category" == Disappeared || "$category" == Interrupted ) ]]; then
+        retry=RetryLimitReached
+    elif [[ "$category" == Interrupted ]]; then
+        retry=RetryLimitReached
+        if [[ "$root_retry_done" != true ]]; then
+            root_retry_done=true
+            printf 'Directory enumeration was interrupted; retrying root once: %q\n' "$root" >&2
+            find_candidates "$root" "$work/retry-candidates" "$work/retry-errors" true || retry_code=$?
+            cat "$work/retry-candidates" >> "$work/candidates"
+            while IFS= read -r retry_diagnostic; do
+                case "$retry_diagnostic" in *': Interrupted system call') retry_interrupted=true ;; esac
+                record_find_diagnostic "$root" "$retry_diagnostic" false
+            done < "$work/retry-errors"
+            if (( retry_code != 0 )) && [[ ! -s "$work/retry-errors" ]]; then
+                retry=RetryFailed
+                diagnostic="$diagnostic; retry failed with exit code $retry_code and no diagnostic."
+            elif [[ "$retry_interrupted" == true ]]; then
+                retry=RetryInterrupted
+            else
+                retry=RootReenumerated
+                resolved=true
+            fi
+        fi
+    elif [[ "$category" == Disappeared ]]; then
+        retry=StillMissing
+        if [[ -e "$path" || -L "$path" ]]; then
+            if retry_path_in_scope "$root" "$path"; then
+                find_candidates "$path" "$work/retry-candidates" "$work/retry-errors" true || retry_code=$?
+                cat "$work/retry-candidates" >> "$work/candidates"
+                if (( retry_code == 0 )); then
+                    retry=EntryRescanned
+                    if [[ -d "$path" && ! -L "$path" ]]; then retry=SubtreeRescanned; fi
+                    resolved=true
+                else
+                    retry=RetryFailed
+                    retry_detail=$(< "$work/retry-errors")
+                    if [[ -z "$retry_detail" ]]; then retry_detail="Search failed with exit code $retry_code and no diagnostic."; fi
+                    diagnostic="$diagnostic; retry: $retry_detail"
+                fi
+            else
+                retry=OutsideScopeOrUnverifiable
+            fi
+        fi
+    fi
+    add_error "$path" Enumerate "$diagnostic" "$category" "$retry" "$resolved"
 }
 
 add_finding() {
     local kind=$1 path=$2 evidence=$3 location=OtherOnDisk
     case "$kind" in
-        CachedPackage|CachedStartupHook|KnownMaliciousWheelHash) location=Archive ;;
+        CachedPackage|CachedStartupHook|CachedHelperModule|KnownMaliciousWheelHash) location=Archive ;;
         *) case "$path" in */site-packages/*) location=SitePackages ;; esac ;;
     esac
     {
@@ -174,6 +353,21 @@ add_finding() {
     } >> "$work/findings"
     html_row "$kind" "$location" "$path" "$evidence" >> "$work/findings-html"
     printf 'Indicator (%s): %q\n' "$kind" "$path"
+}
+
+check_indicators() {
+    local path=$1 displayed=$2 storage=$3 note=${4:-} leaf parent hook=StartupHookOnDisk helper=HelperModuleOnDisk
+    leaf=${path##*/}
+    parent=${path%/*}
+    if [[ "$storage" == Archive ]]; then hook=CachedStartupHook; helper=CachedHelperModule; fi
+    case "$leaf" in
+        agent_framework_meta.pth|af_runtime_diag.pth) add_finding "$hook" "$displayed" "$leaf$note" ;;
+        af_runtime_diag.py) add_finding "$helper" "$displayed" "$leaf$note" ;;
+        _telemetry.py)
+            if [[ ${parent##*/} == agent_framework_meta ]]; then
+                add_finding "$helper" "$displayed" "agent_framework_meta/_telemetry.py$note"
+            fi ;;
+    esac
 }
 
 read_metadata() {
@@ -200,9 +394,13 @@ read_metadata() {
 }
 
 read_dependencies() {
-    local file=$1 version versions
-    if (( $(wc -c < "$file") > 8388608 )); then
-        add_error "$file" DependencyFile 'Dependency file exceeds the 8 MiB inspection limit.'
+    local file=$1 version versions size
+    if ! size=$(wc -c < "$file" 2>"$work/tool-errors"); then
+        add_error "$file" DependencyFile 'Could not read dependency file size.'
+        return
+    fi
+    if (( size > 8388608 )); then
+        add_error "$file" DependencyFile 'Dependency file exceeds the 8 MiB inspection limit.' InspectionLimit
         return
     fi
     if ! versions=$(awk '
@@ -257,7 +455,7 @@ read_dependencies() {
 }
 
 read_archive() {
-    local file=$1 hash_output hash signature entry leaf size
+    local file=$1 hash_output hash signature entry size metadata_code
     if [[ "$hash_tool" == shasum ]]; then
         if ! hash_output=$(shasum -a 256 "$file" 2>"$work/tool-errors"); then
             add_error "$file" Hash 'Could not hash archive.'; return
@@ -283,19 +481,17 @@ read_archive() {
         add_error "$file" Archive 'Could not list ZIP entries.'; return
     fi
     while IFS= read -r entry; do
-        leaf=${entry##*/}
-        case "$leaf" in
-            agent_framework_meta.pth|af_runtime_diag.pth)
-                add_finding CachedStartupHook "$file::$entry" "$leaf" ;;
-        esac
+        check_indicators "$entry" "$file::$entry" Archive
         if [[ "$entry" =~ (^|/)agent[-_.]framework-[^/]+\.dist-info/METADATA$ ]]; then
-            if ! unzip -p "$file" "$entry" 2>"$work/tool-errors" | head -c 1048577 > "$work/metadata"; then
-                add_error "$file::$entry" ArchiveMetadata 'Could not read bounded archive metadata.'
-                continue
-            fi
+            metadata_code=0
+            unzip -p "$file" "$entry" 2>"$work/tool-errors" | head -c 1048577 > "$work/metadata" || metadata_code=$?
             size=$(wc -c < "$work/metadata")
             if (( size > 1048576 )); then
-                add_error "$file::$entry" ArchiveMetadata 'Metadata exceeds the 1 MiB inspection limit.'
+                add_error "$file::$entry" ArchiveMetadata 'Metadata exceeds the 1 MiB inspection limit.' InspectionLimit
+                continue
+            fi
+            if (( metadata_code != 0 )); then
+                add_error "$file::$entry" ArchiveMetadata 'Could not read bounded archive metadata.'
                 continue
             fi
             read_metadata "$work/metadata" "$file::$entry" CachedPackage
@@ -304,60 +500,55 @@ read_archive() {
 }
 
 printf 'Agent Framework exposure check: %s mode. No Python will be run.\n' "$mode"
+printf 'Access preflight checks enumeration only; it cannot certify Full Disk Access.\n'
+printf 'If access is blocked, ask IT to approve Files & Folders or Full Disk Access for the launching terminal, then rerun.\n'
+printf 'Permissions are never changed automatically. Do not use sudo or disable security controls to bypass restrictions.\n'
+printf 'Scope: .git included; symlink targets and nested mounts excluded. Add authorized physical targets/volumes as --root arguments.\n'
 for root in "${roots[@]}"; do
+    while [[ "$root" != / && "$root" == */ ]]; do root=${root%/}; done
     if [[ -L "$root" ]]; then
-        { json_string "$root"; printf '\n'; } >> "$work/skipped"
-        { printf '<li>'; html_string "$root"; printf '</li>\n'; } >> "$work/skipped-html"
+        check_indicators "$root" "$root" OnDisk ' (symlink name only; target not inspected)'
+        add_skipped_link "$root"
         continue
     fi
-    if [[ ! -d "$root" ]]; then add_error "$root" ResolveRoot 'Root is missing or is not a directory.'; continue; fi
-    root=$(cd -P -- "$root" && pwd -P)
+    if [[ ! -d "$root" ]]; then add_error "$root" ResolveRoot 'Root is missing or is not a directory.' InvalidRoot; continue; fi
+    if ! physical_root=$(cd -P -- "$root" 2>"$work/tool-errors" && pwd -P); then
+        add_error "$root" ResolveRoot "$(< "$work/tool-errors")" AccessDenied
+        continue
+    fi
+    root=$physical_root
     { json_string "$root"; printf '\n'; } >> "$work/roots"
     { printf '<li>'; html_string "$root"; printf '</li>\n'; } >> "$work/roots-html"
     printf 'Searching root: %q\n' "$root"
-    if [[ "$mode" == Quick ]]; then
-        find "$root" -xdev \( -type d -name .git -prune \) -o \
-            \( -type l -o \( -type f \( -iname agent_framework_meta.pth -o -iname af_runtime_diag.pth \
-            -o -iname af_runtime_diag.py -o -iname _telemetry.py \) \) \) -print0 \
-            > "$work/candidates" 2> "$work/find-errors" &
-    else
-        find "$root" -xdev \( -type d -name .git -prune \) -o \
-            \( -type l -o \( -type f \( -iname agent_framework_meta.pth -o -iname af_runtime_diag.pth \
-            -o -iname af_runtime_diag.py -o -iname _telemetry.py -o -iname METADATA \
-            -o -iname '*.whl' -o -iname '*.zip' -o -iname '*.body' \
-            -o -iname 'requirements*.txt' -o -iname 'requirements*.in' -o -iname 'constraints*.txt' \
-            -o -iname uv.lock -o -iname poetry.lock -o -iname pdm.lock -o -iname 'pylock*.toml' \
-            -o -iname Pipfile -o -iname Pipfile.lock -o -iname pyproject.toml -o -iname setup.cfg -o -iname setup.py \) \) \) -print0 \
-            > "$work/candidates" 2> "$work/find-errors" &
+    access_preflight "$root"
+    root_retry_done=false
+    find_code=0
+    find_candidates "$root" "$work/candidates" "$work/find-errors" || find_code=$?
+    if (( find_code != 0 )) && [[ ! -s "$work/find-errors" ]]; then
+        add_error "$root" Enumerate "Directory search failed with exit code $find_code and no diagnostic." TraversalFailure
     fi
-    find_pid=$!
-    seconds=0
-    while kill -0 "$find_pid" 2>/dev/null; do
-        sleep 1
-        seconds=$((seconds+1))
-        if (( seconds % 10 == 0 )); then printf 'Still searching this root (%s seconds)...\n' "$seconds"; fi
-    done
-    if ! wait "$find_pid"; then add_error "$root" Find 'Directory search did not complete successfully; see FindDiagnostic entries.'; fi
-    find_pid=
     while IFS= read -r diagnostic; do
-        add_error "$root" FindDiagnostic "$diagnostic"
+        record_find_diagnostic "$root" "$diagnostic"
     done < "$work/find-errors"
     while IFS= read -r -d '' file; do
         if [[ -L "$file" ]]; then
-            { json_string "$file"; printf '\n'; } >> "$work/skipped"
-            { printf '<li>'; html_string "$file"; printf '</li>\n'; } >> "$work/skipped-html"
+            check_indicators "$file" "$file" OnDisk ' (symlink name only; target not inspected)'
+            add_skipped_link "$file"
+            continue
+        fi
+        if [[ ! -f "$file" ]]; then
+            add_error "$file" Inspect 'Candidate disappeared or is no longer a regular file.' Disappeared
             continue
         fi
         files_examined=$((files_examined+1))
         leaf=${file##*/}
         parent=${file%/*}
-        case "$leaf" in
-            agent_framework_meta.pth|af_runtime_diag.pth) add_finding StartupHookOnDisk "$file" "$leaf" ;;
-            af_runtime_diag.py) add_finding HelperModuleOnDisk "$file" "$leaf" ;;
-            _telemetry.py)
-                if [[ ${parent##*/} == agent_framework_meta ]]; then add_finding HelperModuleOnDisk "$file" 'agent_framework_meta/_telemetry.py'; fi ;;
-        esac
+        check_indicators "$file" "$file" OnDisk
         if [[ "$mode" == Quick ]]; then continue; fi
+        if [[ ! -r "$file" ]]; then
+            add_error "$file" Inspect 'Candidate is not readable.' AccessDenied
+            continue
+        fi
         if (( files_examined % 200 == 0 )); then printf 'Deep inspection: %s candidate files processed...\n' "$files_examined"; fi
         if [[ "$leaf" == METADATA && ${parent##*/} =~ ^agent[-_.]framework-[^/]+\.dist-info$ ]]; then
             read_metadata "$file" "$file" PackageOnDisk
@@ -370,17 +561,32 @@ for root in "${roots[@]}"; do
     done < "$work/candidates"
 done
 
-for name in findings inventory roots skipped findings-html inventory-html roots-html skipped-html; do
+for name in findings errors inventory roots skipped symlinks findings-html errors-html inventory-html roots-html skipped-html; do
     sort -u -o "$work/$name" "$work/$name"
 done
 finding_count=$(wc -l < "$work/findings")
 error_count=$(wc -l < "$work/errors")
+coverage_gaps=$(awk '/"Resolved":false/ { n++ } END { print n+0 }' "$work/errors")
 skipped_count=$(wc -l < "$work/skipped")
 root_count=$(wc -l < "$work/roots")
 status=NoIndicatorsInScannedScope
-if (( finding_count > 0 )); then status=IndicatorsFound
-elif (( error_count > 0 || skipped_count > 0 || root_count == 0 )); then status=Incomplete
+coverage_status=Complete
+finding_status=NoIndicatorsFound
+exit_code=0
+if (( coverage_gaps > 0 || skipped_count > 0 || root_count == 0 )); then
+    coverage_status=Incomplete
+    status=Incomplete
+    exit_code=2
 fi
+if (( finding_count > 0 )); then status=IndicatorsFound
+    finding_status=IndicatorsFound
+    if [[ "$coverage_status" == Complete ]]; then exit_code=3; else exit_code=4; fi
+fi
+access_denied_count=$(awk '/"Category":"AccessDenied"/ { n++ } END { print n+0 }' "$work/errors")
+disappeared_count=$(awk '/"Category":"Disappeared"/ { n++ } END { print n+0 }' "$work/errors")
+directory_link_count=$(awk '/"TargetType":"Directory"/ { n++ } END { print n+0 }' "$work/symlinks")
+file_link_count=$(awk '/"TargetType":"File"/ { n++ } END { print n+0 }' "$work/symlinks")
+unavailable_link_count=$(awk '/"TargetType":"Unavailable"/ { n++ } END { print n+0 }' "$work/symlinks")
 
 json_array() {
     local separator= item
@@ -400,15 +606,26 @@ if ! (
         printf ',"StartedUtc":'; json_string "$started"
         printf ',"ScanTimeUtc":'; json_string "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
         printf ',"Status":'; json_string "$status"
+        printf ',"FindingStatus":'; json_string "$finding_status"
+        printf ',"CoverageStatus":'; json_string "$coverage_status"
+        printf ',"ExitCode":%s,"UnresolvedErrorCount":%s' "$exit_code" "$coverage_gaps"
         printf ',"CandidateFilesExamined":%s,"Roots":' "$files_examined"; json_array "$work/roots"
+        printf ',"RequestedRoots":['
+        separator=
+        for root in "${roots[@]}"; do printf '%s' "$separator"; json_string "$root"; separator=,; done
+        printf ']'
+        printf ',"ScopePolicy":{"GitDirectoriesIncluded":true,"FollowSymlinks":false,"CrossFilesystems":false}'
+        printf ',"AccessPreflight":'; json_array "$work/preflight"
+        printf ',"DirectorySearches":'; json_array "$work/searches"
         printf ',"Findings":'; json_array "$work/findings"
         printf ',"PackageInventory":'; json_array "$work/inventory"
         printf ',"Errors":'; json_array "$work/errors"
         printf ',"SkippedSymlinks":'; json_array "$work/skipped"
+        printf ',"Symlinks":'; json_array "$work/symlinks"
         printf ',"Limitations":['
         json_string 'Point-in-time file inspection only; no proof of historical absence, execution, or exfiltration.'
         printf ','; json_string 'Quick checks filenames only. Deep inspects selected metadata, dependency files, ZIP/wheels and pip bodies, not other archive formats or nested/container layers.'
-        printf ','; json_string 'Symlinks, .git directories and nested filesystem mounts are not followed. Inspect authorized physical targets/volumes as explicit roots.'
+        printf ','; json_string '.git directories are included. Symlink targets and nested filesystem mounts are not followed. Inspect authorized physical targets/volumes as explicit roots.'
         printf ','; json_string 'Dependency parsing covers common exact pins, conventional Pipfile.lock objects, and TOML package records, not arbitrary build code or a universal dependency resolver.'
         printf ','; json_string 'CandidateFilesExamined counts files selected by filename, not every file traversed. No Python, package imports, or credential files are executed/read.'
         printf ']}\n'
@@ -436,6 +653,8 @@ HTML
         printf '<br><strong>Mode:</strong> '; html_string "$mode"
         printf ' | <strong>Scope:</strong> '; html_string "$scope"
         printf ' | <strong>Started (UTC):</strong> '; html_string "$started"; printf '</p>'
+        printf '<p><strong>Findings status:</strong> '; html_string "$finding_status"
+        printf ' | <strong>Coverage:</strong> '; html_string "$coverage_status"; printf '</p>'
         printf '<div class="notice"><strong>'; html_string "$status"; printf '</strong><p>'
         case "$status" in
             IndicatorsFound) printf 'Indicators need security-team review. Preserve evidence and avoid starting suspect Python environments.' ;;
@@ -445,22 +664,29 @@ HTML
         printf '</p><p>Completion does not establish safety. Errors and skipped locations remain important even when indicators are found.'
         printf ' This tool does not verify execution, prove credential theft, or remediate anything.</p></div>'
         printf '<div class="summary"><span><strong>Findings:</strong> %s</span>' "$finding_count"
-        printf '<span><strong>Errors:</strong> %s</span><span><strong>Skipped symlinks:</strong> %s</span>' "$error_count" "$skipped_count"
+        printf '<span><strong>Diagnostics:</strong> %s (%s unresolved)</span><span><strong>Skipped symlinks:</strong> %s</span>' "$error_count" "$coverage_gaps" "$skipped_count"
         printf '<span><strong>Candidate files examined:</strong> %s</span></div>' "$files_examined"
         printf '<h2>Findings</h2>'
         html_table "$work/findings-html" '<tr><th>Kind</th><th>LocationType</th><th>Path</th><th>Evidence</th></tr>'
         printf '<p>SitePackages is a path-based triage aid, not proof of installation or execution. Archives may never have been installed.</p>'
         printf '<h2>Inspection roots</h2>'; html_list "$work/roots-html"
-        printf '<h2>Coverage errors</h2>'
-        html_table "$work/errors-html" '<tr><th>Operation</th><th>Path</th><th>Detail</th></tr>'
-        printf '<h2>Skipped symlinks</h2>'; html_list "$work/skipped-html"
+        printf '<p>Both modes include hidden folders and .git. Symlink targets and nested filesystem mounts are excluded; supply authorized physical targets/volumes as explicit roots.</p>'
+        printf '<h2>Access preflight</h2><p>Enumeration probes do not certify Full Disk Access. If access is blocked, ask IT to approve Files &amp; Folders or Full Disk Access for the launching terminal, then rerun. No permissions are changed automatically.</p>'
+        html_table "$work/preflight-html" '<tr><th>Path</th><th>Accessible</th><th>Detail</th></tr>'
+        printf '<h2>Coverage diagnostics</h2><p>Access denied: %s; disappeared paths: %s. Search exit codes are recorded separately in JSON, not counted as duplicate errors.</p>' "$access_denied_count" "$disappeared_count"
+        printf '<details><summary>Show %s diagnostics (%s unresolved)</summary>' "$error_count" "$coverage_gaps"
+        html_table "$work/errors-html" '<tr><th>Category</th><th>Operation</th><th>Path</th><th>Retry</th><th>Detail</th></tr>'
+        printf '</details><h2>Skipped symlinks</h2>'
+        printf '<p>Directory targets: %s; file targets: %s; unavailable or other targets: %s. Target type is metadata-only triage, not proof of target inspection. All skipped links remain coverage gaps.</p>' "$directory_link_count" "$file_link_count" "$unavailable_link_count"
+        printf '<details><summary>Show up to 20 examples; every skipped path is retained in JSON</summary>'
+        html_list "$work/skipped-html"; printf '</details>'
         printf '<h2>Package inventory (Deep mode only)</h2>'
         html_table "$work/inventory-html" '<tr><th>Version</th><th>Kind</th><th>Path</th></tr>'
         cat <<'HTML'
 <h2>Limitations</h2><ul>
 <li>Point-in-time file inspection only; no proof of historical absence, execution, or exfiltration.</li>
 <li>Quick checks filenames only. Deep inspects selected metadata, dependency files, ZIP/wheels and pip bodies, not other archive formats or nested/container layers.</li>
-<li>Symlinks, .git directories and nested filesystem mounts are not followed. Inspect authorized physical targets/volumes as explicit roots.</li>
+<li>.git directories are included. Symlink targets and nested filesystem mounts are not followed. Inspect authorized physical targets/volumes as explicit roots.</li>
 <li>Dependency parsing is not a universal dependency resolver.</li>
 <li>Candidate files examined counts filename-selected files, not every file traversed. No Python or package imports are run.</li>
 </ul><p><small>Share this report and its JSON companion only through your approved security/IT process.
@@ -470,7 +696,8 @@ HTML
     } > "$html_report"
 ); then printf 'ERROR: Could not save HTML report: %q\n' "$html_report" >&2; exit 1
 fi
-printf '\nResult: %s; %s findings; %s errors; %s skipped symlinks.\n' "$status" "$finding_count" "$error_count" "$skipped_count"
+printf '\nResult: %s; coverage: %s; %s findings; %s diagnostics (%s unresolved); %s skipped symlinks.\n' "$status" "$coverage_status" "$finding_count" "$error_count" "$coverage_gaps" "$skipped_count"
 printf 'Open this HTML report in a browser: %q\n' "$html_report"
 printf 'JSON companion: %q\n' "$report"
 printf 'Send both reports to your security/IT contact. A completed scan does NOT establish that the machine is safe.\n'
+exit "$exit_code"

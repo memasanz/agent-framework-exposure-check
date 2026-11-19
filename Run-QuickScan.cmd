@@ -28,18 +28,32 @@ set "HTML_REPORT=%REPORT:.json=.html%"
 set "SCAN_EXIT=%ERRORLEVEL%"
 
 echo.
-if "%SCAN_EXIT%"=="0" (
-    echo Scan finished. Review the result above.
-    echo Open this report in a browser:
-    echo "%HTML_REPORT%"
-    echo JSON companion: "%REPORT%"
-    echo Send both reports to your security or IT contact.
-    echo A completed scan does NOT establish that the machine is safe.
-) else (
-    echo ERROR: The scan could not finish. See the error message above.
-    echo If Windows or your organization blocks the script, contact IT.
-    echo Do not disable security controls or change execution policy.
+if "%SCAN_EXIT%"=="0" goto reports
+if "%SCAN_EXIT%"=="2" (
+    echo WARNING: Reports saved, but coverage is incomplete. Ask IT to review access and skipped locations.
+    goto reports
 )
+if "%SCAN_EXIT%"=="3" (
+    echo ALERT: Reports saved with indicators. Avoid suspect Python environments and contact IT.
+    goto reports
+)
+if "%SCAN_EXIT%"=="4" (
+    echo ALERT: Reports saved with indicators AND incomplete coverage. Contact IT.
+    goto reports
+)
+echo ERROR: The scanner failed. A report pair may be missing or partial.
+echo If Windows or your organization blocks the script, contact IT.
+echo Do not disable security controls or change execution policy.
+goto finish
+
+:reports
+echo Open this report in a browser:
+echo "%HTML_REPORT%"
+echo JSON companion: "%REPORT%"
+echo Send both reports to your security or IT contact.
+echo A completed scan does NOT establish that the machine is safe.
+
+:finish
 echo.
 pause
 endlocal & exit /b %SCAN_EXIT%

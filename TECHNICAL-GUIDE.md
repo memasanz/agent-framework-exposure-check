@@ -67,7 +67,9 @@ If Gatekeeper, privacy permissions, or endpoint controls block access or
 execution, use your approved IT process rather than disabling protections.
 Have IT review/approve the files before broad distribution.
 
-**Validation:** Windows behavior is tested on PowerShell 5.1 and 7.
+**Validation (repository checkout, not the distribution ZIP):**
+Windows fixtures use only PowerShell/.NET:
+`.\tests\windows_test.ps1`, run on both Windows PowerShell 5.1 and PowerShell 7.
 The shell scanner and launcher logic have native macOS Bash 3.2 regression
 fixtures (`/usr/bin/ruby tests/macos_test.rb`, using Ruby's standard library
 and bundled Minitest; no package installation or Python).
@@ -75,6 +77,16 @@ Finder double-click launching still needs an IT smoke test before broad
 distribution.
 
 ## Windows command-line options (advanced)
+
+Windows PowerShell 5.1 can fail when enumerating deeply nested paths near
+the legacy 260-character limit, sometimes reporting a wrapped
+`DirectoryNotFoundException` even when the directory exists. The scanner
+uses extended filesystem paths internally for traversal and inspection;
+report paths remain readable without that prefix. No system policy or
+registry changes are required. Coverage errors include the underlying
+exception type and filesystem diagnostic rather than only
+`MethodInvocationException`. Non-filesystem inspection messages that could
+include file contents are omitted from reports.
 
 Save `Test-AgentFrameworkExposure.ps1` in any folder. **It does not need to
 be inside the user's profile, a Python environment, or a project folder.**
@@ -143,6 +155,57 @@ report. If either destination already exists, scanning is refused before it
 begins. The reports record mode, scope, actual roots, duration, findings, and
 coverage gaps. A report destination must have an existing parent directory.
 
+### Windows access and coverage
+
+Before traversal, enumeration-only preflight probes check each physical root
+and selected profile folders within it. `AccessPreflight` records these probes;
+success does not certify access to every descendant. Ask IT to review filesystem
+permissions, cloud availability and endpoint controls, then rerun after approved
+changes. The scanner never changes ACLs, downloads placeholders, elevates, or
+changes execution policy.
+
+Hidden folders and `.git` are included. Reparse-point directories, junctions,
+mounted folders, offline/recall placeholders and link targets are not traversed.
+Roots and retries with reparse-point ancestors are rejected rather than silently
+expanding scope. Supply approved physical targets separately. Cloud-provider
+directories may be reparse points even when PowerShell shows no `LinkType`.
+Live filesystem changes cannot be ruled out atomically.
+
+All four indicator names are checked on skipped entries, including broken links,
+before skipping; a name match is not proof of target contents or execution.
+`SkippedReparsePoints` retains every skipped path. `ReparsePoints` adds entry
+type, disposition and `CoverageGap`, without opening targets. Non-directory
+`.exe` reparse entries are outside the package-content inspection scope and do
+not alone cause incomplete coverage; a directory named `.exe` still does.
+HTML groups these records and shows at most 20 coverage-gap examples. Full paths
+remain in JSON.
+
+`Errors` keeps the affected path, underlying exception, safe original `Detail`,
+`Category`, `RetryOutcome` and `Resolved`. Access denials are not retried.
+Disappeared/interrupted directories or candidates can be retried once, only
+when still verifiably within the original physical root and without crossing a
+reparse/mount boundary. Partial results survive a failed enumeration; repeated
+failures stay unresolved. Directory-level recovery is more targeted than
+macOS's root-level BSD `find` recovery.
+`DirectorySearches` contains failed/retried directory attempts only, not a
+duplicate summary error. `DirectoryEnumerationCount` counts all attempts
+excluding preflight. `UnresolvedErrorCount` excludes successful recoveries.
+HTML summarizes diagnostic causes and shows at most 100 detailed diagnostics;
+JSON retains them all.
+
+Windows bounds disk and archived metadata to 1 MiB and dependency files to
+8 MiB, including streams whose size changes or whose ZIP size is misleading.
+Exceeding a limit is an `InspectionLimit` coverage gap, not a clean result.
+All four filename checks apply inside ZIP/wheel entries too.
+Windows filesystem names cannot contain most control characters; JSON preserves
+UTF-8/control characters in supplied diagnostic paths and supported archive
+names. .NET Framework's ZIP reader can reject archive names containing Windows-
+invalid characters; such archives remain coverage gaps rather than certifying
+their contents safe.
+`FilesScanned` counts regular files enumerated; `CandidateFilesExamined` counts
+files selected by the mode's filename rules, with enumeration retries deduplicated.
+Both platforms use the findings/coverage fields and exit codes documented below.
+
 ### Optional Python environment discovery
 
 For targeted Deep investigations, optional discovery can first
@@ -190,8 +253,8 @@ and interactive progress shows discovery/inspection activity.
 
 Discovery only lists filesystem entries and checks marker paths; it does not
 inspect every file's contents on a drive. Package inspection then reads the
-supported files under its roots. Reparse-point directories and `.git` are
-not traversed. Access-denied locations and skipped links are reported;
+supported files under its roots. `.git` is included; reparse-point directories
+are not traversed. Access-denied locations and skipped links are reported;
 do not interpret incomplete coverage as safety. Fixed-drive mode excludes
 network/removable drives, WSL/container filesystems, and drives that are not
 ready. It can reach other user profiles only to the extent current access
@@ -205,6 +268,13 @@ files; existing reports are never overwritten. Paths can contain user/project na
 so handle reports as internal incident evidence.
 
 ## macOS command-line options (advanced)
+
+macOS may show a privacy prompt saying that Terminal/iTerm would like to
+"access data from other apps". This is an operating-system permission for
+the terminal application, not just this script. Follow IT/security policy
+before allowing access. Declining may leave coverage gaps; review `Errors`
+and skipped locations rather than treating an incomplete scan as safety.
+See the screenshot in the [simple instructions](README.md#mac-privacy-prompt).
 
 The packaged ZIP marks the `.command` launchers executable, but source
 downloads or some extraction tools may lose those permissions. For approved
@@ -308,13 +378,13 @@ overwritten. An explicit `--report` must end in `.json`.
 Temporary inspection files are private and removed on normal exit/interruption.
 Nothing is uploaded and no remediation is performed.
 
-macOS reports keep the legacy `Status` and add independent `FindingStatus`
+Both platforms keep the legacy `Status` and add independent `FindingStatus`
 (`NoIndicatorsFound` or `IndicatorsFound`) and `CoverageStatus` (`Complete` or
 `Incomplete`). `Complete` applies only to the requested filesystem scope and
 documented inspection rules, not historical absence or whole-machine safety.
 Coverage remains visible even when indicators are found.
 
-The macOS scanner and launchers return these process exit codes:
+Both scanners and all four launchers return these process exit codes:
 
 | Code | Meaning |
 | --- | --- |
@@ -324,11 +394,10 @@ The macOS scanner and launchers return these process exit codes:
 | `3` | Reports saved with indicators, requested inspection complete within documented limits. |
 | `4` | Reports saved with indicators and incomplete coverage. |
 
-Signal interruption can return the usual `130`/`143` without reports.
+On macOS, signal interruption can return the usual `130`/`143` without reports.
 The launchers distinguish incomplete reports and indicators from a fatal
 scanner failure. Automation must not treat a nonzero code as proof that no
-reports exist, nor code `0` as proof that the machine is safe. Windows exit
-behavior is unchanged.
+reports exist, nor code `0` as proof that the machine is safe.
 
 ## Reading and sharing reports
 
@@ -359,7 +428,7 @@ warnings even when findings are present.
 | `PackageOnDisk` | Affected package metadata exists on disk. Check whether its path is an installed environment, staging directory, or extracted cache. |
 | `StartupHookOnDisk` / `HelperModuleOnDisk` | Advisory-listed filenames exist. Preserve and investigate; names alone are not cryptographic proof. A hook in active `site-packages` is urgent. |
 | `KnownMaliciousWheelHash` | File bytes match a wheel SHA-256 from the advisory. A cached wheel alone does not establish execution. |
-| `CachedPackage` / `CachedStartupHook` / `CachedHelperModule` | Affected metadata, startup-hook, or helper filename exists inside a wheel/ZIP/pip HTTP cache body. The helper kind is emitted by the macOS scanner. |
+| `CachedPackage` / `CachedStartupHook` / `CachedHelperModule` | Affected metadata, startup-hook, or helper filename exists inside a wheel/ZIP/pip HTTP cache body. |
 | `DependencyReference` | An exact bad version appears in a supported dependency declaration/artifact reference. Establish whether it was installed. |
 
 Every finding has `LocationType`: `SitePackages`, `Archive`, or `OtherOnDisk`.
@@ -368,17 +437,17 @@ This is a path-based triage aid, not proof of installation or execution.
 matches in `site-packages`, avoid launching that environment and contact your
 security team for verification/containment. Do not automatically delete files.
 
-Always inspect `Errors` and `SkippedReparsePoints` (macOS: `SkippedSymlinks` and
-`CoverageStatus`), even with
+Always inspect `Errors`, `CoverageStatus` and `ReparsePoints.CoverageGap`
+(macOS: `SkippedSymlinks`), even with
 `IndicatorsFound`. Symlinks/junctions are not followed; pass their physical
-targets as additional roots. Windows excludes `.git`; macOS includes it. ZIP inspection
+targets as additional roots. Both platforms include `.git`. ZIP inspection
 does not cover tarballs, nested archives, encrypted archives, or container
 layers. Dependency parsing covers common requirements/constraints, uv/Poetry/PDM
 package records, Pipfile.lock, and direct exact pins; it is not a universal
 dependency resolver or log scanner. The Windows script returns a report
-object, not an incident-status process exit code. Fleet automation should
-evaluate `Status`, `Findings`, and coverage fields; macOS also has the exit
-codes described above.
+object and sets the incident-status process exit code. Fleet automation should
+evaluate `FindingStatus`, `CoverageStatus`, `Findings`, and diagnostics as well
+as the exit codes described above.
 
 Deep-mode package inventory includes unaffected versions too; Quick mode does
 not inventory package versions. Finding only 1.26.0 now

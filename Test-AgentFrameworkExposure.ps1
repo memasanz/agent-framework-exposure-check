@@ -618,9 +618,10 @@ if (-not $Roots) {
 
 Write-Host "Agent Framework exposure check: $Mode mode. No Python or pip will be run."
 $requestedRoots = @($Roots)
-Write-Host 'Access preflight checks enumeration only; it cannot certify complete access.'
-Write-Host 'Ask IT to review access warnings, cloud availability and endpoint controls, then rerun after approved changes.'
-Write-Host 'No permissions are changed. Do not elevate or bypass security controls without IT approval.'
+Write-Host 'Before scanning, the tool checks whether your account can list folders.'
+Write-Host 'NOTE: This is general guidance, not a warning about your computer.'
+Write-Host 'If the report says some folders could not be checked, ask IT to review those folders.'
+Write-Host 'The scanner does not change permissions. Do not run as administrator or change security settings without IT approval.'
 Write-Host 'Hidden folders and .git are included. Reparse targets and mounted folders are not followed.'
 if ($DiscoverPython) {
     if (-not $DiscoveryRoots) {

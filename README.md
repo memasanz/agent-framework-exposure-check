@@ -5,7 +5,8 @@ Check a Windows or Mac computer for signs of the compromised
 
 ## 1. Extract the ZIP
 
-Download `AgentFramework-QuickScan.zip` and extract it:
+[Download AgentFramework-QuickScan.zip](https://github.com/memasanz/agent-framework-exposure-check/releases/latest/download/AgentFramework-QuickScan.zip)
+and extract it:
 
 - **Windows:** right-click the ZIP and choose **Extract All**.
 - **Mac:** double-click the ZIP.

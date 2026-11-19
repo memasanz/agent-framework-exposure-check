@@ -51,8 +51,16 @@ if (( root_arguments == 0 )); then roots=("$HOME"); scope=UserProfile; fi
 if [[ -z "$report" ]]; then
     report="$HOME/AgentFramework-${mode}Report-$(date -u '+%Y%m%dT%H%M%SZ')-$$.json"
 fi
+case "$report" in
+    *.json) html_report="${report%.*}.html" ;;
+    *) printf 'Report must end in .json; a matching HTML report is generated alongside it.\n' >&2; exit 1 ;;
+esac
 if [[ -e "$report" || -L "$report" ]]; then
     printf 'Report already exists; choose a new destination: %s\n' "$report" >&2
+    exit 1
+fi
+if [[ -e "$html_report" || -L "$html_report" ]]; then
+    printf 'HTML report already exists; choose a new destination: %s\n' "$html_report" >&2
     exit 1
 fi
 if [[ ! -d "$(dirname "$report")" ]]; then printf 'Report parent directory does not exist.\n' >&2; exit 1; fi
@@ -76,13 +84,16 @@ cleanup() {
     fi
     rm -f -- "$work/findings" "$work/errors" "$work/skipped" "$work/inventory" \
         "$work/roots" "$work/candidates" "$work/find-errors" "$work/zip-entries" \
-        "$work/metadata" "$work/tool-errors"
+        "$work/metadata" "$work/tool-errors" "$work/findings-html" "$work/errors-html" \
+        "$work/skipped-html" "$work/inventory-html" "$work/roots-html"
     rmdir -- "$work"
 }
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-for name in findings errors skipped inventory roots; do : > "$work/$name"; done
+for name in findings errors skipped inventory roots findings-html errors-html skipped-html inventory-html roots-html; do
+    : > "$work/$name"
+done
 
 json_string() {
     local value=$1 character code i
@@ -106,6 +117,38 @@ json_string() {
     printf '"'
 }
 
+html_string() {
+    local value=$1
+    value=${value//&/\&amp;}
+    value=${value//</\&lt;}
+    value=${value//>/\&gt;}
+    value=${value//\"/\&quot;}
+    value=${value//\'/\&#39;}
+    value=${value//$'\n'/\&#10;}
+    value=${value//$'\r'/\&#13;}
+    value=${value//$'\t'/\&#9;}
+    printf '%s' "$value"
+}
+
+html_row() {
+    local value
+    printf '<tr>'
+    for value in "$@"; do printf '<td>'; html_string "$value"; printf '</td>'; done
+    printf '</tr>\n'
+}
+
+html_table() {
+    if [[ ! -s "$1" ]]; then printf '<p>None recorded.</p>'; return; fi
+    printf '<div class="scroll"><table><thead>%s</thead><tbody>' "$2"
+    cat "$1"
+    printf '</tbody></table></div>'
+}
+
+html_list() {
+    if [[ ! -s "$1" ]]; then printf '<p>None recorded.</p>'; return; fi
+    printf '<ul>'; cat "$1"; printf '</ul>'
+}
+
 add_error() {
     {
         printf '{"Path":'; json_string "$1"
@@ -113,6 +156,7 @@ add_error() {
         printf ',"Detail":'; json_string "$3"
         printf '}\n'
     } >> "$work/errors"
+    html_row "$2" "$1" "$3" >> "$work/errors-html"
 }
 
 add_finding() {
@@ -128,6 +172,7 @@ add_finding() {
         printf ',"Evidence":'; json_string "$evidence"
         printf '}\n'
     } >> "$work/findings"
+    html_row "$kind" "$location" "$path" "$evidence" >> "$work/findings-html"
     printf 'Indicator (%s): %q\n' "$kind" "$path"
 }
 
@@ -148,6 +193,7 @@ read_metadata() {
         printf ',"Kind":'; json_string "$kind"
         printf '}\n'
     } >> "$work/inventory"
+    html_row "$version" "$kind" "$displayed_path" >> "$work/inventory-html"
     case "$version" in
         1.26.1|1.26.2) add_finding "$kind" "$displayed_path" "agent-framework==$version" ;;
     esac
@@ -261,11 +307,13 @@ printf 'Agent Framework exposure check: %s mode. No Python will be run.\n' "$mod
 for root in "${roots[@]}"; do
     if [[ -L "$root" ]]; then
         { json_string "$root"; printf '\n'; } >> "$work/skipped"
+        { printf '<li>'; html_string "$root"; printf '</li>\n'; } >> "$work/skipped-html"
         continue
     fi
     if [[ ! -d "$root" ]]; then add_error "$root" ResolveRoot 'Root is missing or is not a directory.'; continue; fi
     root=$(cd -P -- "$root" && pwd -P)
     { json_string "$root"; printf '\n'; } >> "$work/roots"
+    { printf '<li>'; html_string "$root"; printf '</li>\n'; } >> "$work/roots-html"
     printf 'Searching root: %q\n' "$root"
     if [[ "$mode" == Quick ]]; then
         find "$root" -xdev \( -type d -name .git -prune \) -o \
@@ -297,6 +345,7 @@ for root in "${roots[@]}"; do
     while IFS= read -r -d '' file; do
         if [[ -L "$file" ]]; then
             { json_string "$file"; printf '\n'; } >> "$work/skipped"
+            { printf '<li>'; html_string "$file"; printf '</li>\n'; } >> "$work/skipped-html"
             continue
         fi
         files_examined=$((files_examined+1))
@@ -321,7 +370,9 @@ for root in "${roots[@]}"; do
     done < "$work/candidates"
 done
 
-for name in findings inventory roots skipped; do sort -u -o "$work/$name" "$work/$name"; done
+for name in findings inventory roots skipped findings-html inventory-html roots-html skipped-html; do
+    sort -u -o "$work/$name" "$work/$name"
+done
 finding_count=$(wc -l < "$work/findings")
 error_count=$(wc -l < "$work/errors")
 skipped_count=$(wc -l < "$work/skipped")
@@ -364,6 +415,62 @@ if ! (
     } > "$report"
 ); then printf 'ERROR: Could not save report: %q\n' "$report" >&2; exit 1
 fi
+if ! (
+    set -o noclobber
+    {
+        cat <<'HTML'
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Agent Framework exposure report</title>
+<style>
+body{font:16px/1.5 system-ui,sans-serif;color:#17233b;background:#f3f5f9;margin:0}
+main{max-width:1200px;margin:32px auto;padding:28px;background:white;border-radius:12px}
+h1,h2{line-height:1.2}h2{margin-top:32px}.notice{padding:18px;border-left:5px solid #a85800;background:#fff3dc}
+.summary{display:flex;flex-wrap:wrap;gap:24px;padding:18px 0}.scroll{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;vertical-align:top;padding:10px;border:1px solid #d5dce7}
+th{background:#edf1f7}td,li{overflow-wrap:anywhere;white-space:pre-wrap}small{color:#48566d}
+@media(max-width:700px){main{margin:0;padding:16px}}
+</style></head><body><main><h1>Agent Framework exposure report</h1>
+HTML
+        printf '<p><strong>Computer:</strong> '; html_string "${HOSTNAME:-unknown}"
+        printf '<br><strong>Mode:</strong> '; html_string "$mode"
+        printf ' | <strong>Scope:</strong> '; html_string "$scope"
+        printf ' | <strong>Started (UTC):</strong> '; html_string "$started"; printf '</p>'
+        printf '<div class="notice"><strong>'; html_string "$status"; printf '</strong><p>'
+        case "$status" in
+            IndicatorsFound) printf 'Indicators need security-team review. Preserve evidence and avoid starting suspect Python environments.' ;;
+            Incomplete) printf 'No indicators found, but coverage gaps prevent a complete inspection.' ;;
+            *) printf 'No matching indicators found in the inspected scope. This is not proof that the machine is safe.' ;;
+        esac
+        printf '</p><p>Completion does not establish safety. Errors and skipped locations remain important even when indicators are found.'
+        printf ' This tool does not verify execution, prove credential theft, or remediate anything.</p></div>'
+        printf '<div class="summary"><span><strong>Findings:</strong> %s</span>' "$finding_count"
+        printf '<span><strong>Errors:</strong> %s</span><span><strong>Skipped symlinks:</strong> %s</span>' "$error_count" "$skipped_count"
+        printf '<span><strong>Candidate files examined:</strong> %s</span></div>' "$files_examined"
+        printf '<h2>Findings</h2>'
+        html_table "$work/findings-html" '<tr><th>Kind</th><th>LocationType</th><th>Path</th><th>Evidence</th></tr>'
+        printf '<p>SitePackages is a path-based triage aid, not proof of installation or execution. Archives may never have been installed.</p>'
+        printf '<h2>Inspection roots</h2>'; html_list "$work/roots-html"
+        printf '<h2>Coverage errors</h2>'
+        html_table "$work/errors-html" '<tr><th>Operation</th><th>Path</th><th>Detail</th></tr>'
+        printf '<h2>Skipped symlinks</h2>'; html_list "$work/skipped-html"
+        printf '<h2>Package inventory (Deep mode only)</h2>'
+        html_table "$work/inventory-html" '<tr><th>Version</th><th>Kind</th><th>Path</th></tr>'
+        cat <<'HTML'
+<h2>Limitations</h2><ul>
+<li>Point-in-time file inspection only; no proof of historical absence, execution, or exfiltration.</li>
+<li>Quick checks filenames only. Deep inspects selected metadata, dependency files, ZIP/wheels and pip bodies, not other archive formats or nested/container layers.</li>
+<li>Symlinks, .git directories and nested filesystem mounts are not followed. Inspect authorized physical targets/volumes as explicit roots.</li>
+<li>Dependency parsing is not a universal dependency resolver.</li>
+<li>Candidate files examined counts filename-selected files, not every file traversed. No Python or package imports are run.</li>
+</ul><p><small>Share this report and its JSON companion only through your approved security/IT process.
+Reports can contain internal paths and computer names. No external resources or scripts are loaded by this page.</small></p>
+</main></body></html>
+HTML
+    } > "$html_report"
+); then printf 'ERROR: Could not save HTML report: %q\n' "$html_report" >&2; exit 1
+fi
 printf '\nResult: %s; %s findings; %s errors; %s skipped symlinks.\n' "$status" "$finding_count" "$error_count" "$skipped_count"
-printf 'Report saved to: %q\n' "$report"
-printf 'Send this report to your security/IT contact. A completed scan does NOT establish that the machine is safe.\n'
+printf 'Open this HTML report in a browser: %q\n' "$html_report"
+printf 'JSON companion: %q\n' "$report"
+printf 'Send both reports to your security/IT contact. A completed scan does NOT establish that the machine is safe.\n'

@@ -11,14 +11,16 @@ before an import. Do not download the malicious releases for testing.
 
 ## Easiest way to run
 
-1. Save `AgentFramework-QuickScan.zip` and choose **Extract All**.
+1. Save and extract `AgentFramework-QuickScan.zip` (Windows: **Extract All**;
+   macOS: double-click the ZIP).
 2. Open the extracted folder. On **Windows**, double-click
    **`Run-QuickScan.cmd`**. On **macOS**, double-click
    **`Run-QuickScan.command`**.
-3. Leave the window open until the result appears. Send the
-   **`AgentFramework-QuickReport-*.json`** file saved in your
-   user-profile/home folder to your security/IT contact. The window shows its
-   exact location.
+3. Leave the window open until the result appears. Open the
+   **`AgentFramework-QuickReport-*.html`** file in a browser to read the
+   results. It and a matching **`.json`** file are saved in your
+   user-profile/home folder; the window shows their locations.
+   Send both files to your security/IT contact.
 
 **No commands to type, no Python installation, and no administrator access
 are required for the packaged launchers**, subject to your organization's
@@ -44,8 +46,9 @@ Use **Quick first**. For broader Deep checks, use the separate Full launcher:
 
 Both explain their scope before asking for confirmation. Cancelling starts
 no scanner and creates no report. A started scan saves a uniquely named
-`AgentFramework-FullReport-*.json` in the user's profile/home folder, displays
-its location, and keeps the window open. Review errors/skipped locations;
+`AgentFramework-FullReport-*.html` plus a matching `.json` file in the user's
+profile/home folder, displays their locations, and keeps the window open.
+Open the HTML file in a browser. Review errors/skipped locations;
 "Full" describes the requested scope and Deep mode, not guaranteed coverage.
 These scans can take much longer than Quick scans, do not start Python or
 remediate anything, and do not automatically elevate privileges. Obtain IT
@@ -130,10 +133,10 @@ elevate privileges without IT approval.
 
 The script prints the selected inspection roots before inspection, shows
 interactive progress, and returns a report object plus a readable summary.
-Supply `-ReportPath` to persist JSON; an existing report is refused before
-scanning begins. The JSON records mode, scope, actual roots, duration,
-findings, and coverage gaps. A report destination must have an existing
-parent directory.
+Supply `-ReportPath` ending in `.json` to save both JSON and a matching `.html`
+report. If either destination already exists, scanning is refused before it
+begins. The reports record mode, scope, actual roots, duration, findings, and
+coverage gaps. A report destination must have an existing parent directory.
 
 ### Optional Python environment discovery
 
@@ -211,7 +214,7 @@ From Terminal in the extracted folder:
 /bin/bash ./Test-AgentFrameworkExposure.sh --mode Quick \
     --root "/Users/your-account/work" --root "/opt/homebrew"
 
-# Optional report destination; it must not already exist:
+# Optional JSON destination; a matching HTML report is also created:
 /bin/bash ./Test-AgentFrameworkExposure.sh --report "$HOME/my-scan-report.json"
 ```
 
@@ -240,10 +243,30 @@ coverage errors rather than read without limits. Archive entries with unusual
 embedded newlines may not be parsed reliably by the system ZIP listing tool.
 
 Search progress is printed every ten seconds while directory enumeration is
-active, then periodically during Deep candidate inspection. Reports are
-created with owner-only permissions and existing reports are never overwritten.
+active, then periodically during Deep candidate inspection. Both HTML and JSON
+reports are created with owner-only permissions; existing reports are never
+overwritten. An explicit `--report` must end in `.json`.
 Temporary inspection files are private and removed on normal exit/interruption.
 Nothing is uploaded and no remediation is performed.
+
+## Reading and sharing reports
+
+**Open the `.html` file in your browser.** It contains the status, counts,
+findings with exact paths, inspection roots, coverage errors, skipped
+locations, and Deep-mode package inventory. No application or web server is
+needed. HTML reports are self-contained, load no external assets, contain no
+JavaScript, and escape file-derived text instead of treating it as markup.
+
+The matching `.json` file retains structured results for security/IT analysis.
+An example pair is `AgentFramework-QuickReport-123-456.html` and
+`AgentFramework-QuickReport-123-456.json`. Both files can contain internal
+paths and computer names; share them only through your approved process,
+not in a public repository. `.gitignore` excludes standard report filenames,
+the `reports` folder, local secrets and the generated ZIP package. For custom
+report names, use a `reports` folder that you create first.
+
+Neither file is a certificate that the machine is safe. Review all coverage
+warnings even when findings are present.
 
 ## Interpret results
 
